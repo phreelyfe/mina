@@ -17,4 +17,3 @@ else
   # that on develop instead of always running all the tests
   git ls-files
 fi
-
