@@ -1,4 +1,4 @@
-(* replayer.ml -- replay transactions from archive node *)
+(* replayer.ml -- replay transactions from archive node database *)
 
 open Core
 open Async
@@ -61,8 +61,19 @@ let pk_of_pk_id pool pk_id : Account.key Deferred.t =
             (Caqti_error.show msg) () )
 
 (* cache of fee transfers for coinbases *)
-let fee_transfer_tbl : (int, Coinbase_fee_transfer.t) Hashtbl.t =
-  Int.Table.create ()
+module Fee_transfer_key = struct
+  module T = struct
+    type t = int64 * int [@@deriving hash, sexp, compare]
+  end
+
+  type t = T.t
+
+  include Hashable.Make (T)
+end
+
+let fee_transfer_tbl : (Fee_transfer_key.t, Coinbase_fee_transfer.t) Hashtbl.t
+    =
+  Fee_transfer_key.Table.create ()
 
 let cache_fee_transfer_via_coinbase pool
     (internal_cmd : Sql.Internal_command.t) =
@@ -73,18 +84,23 @@ let cache_fee_transfer_via_coinbase pool
         Currency.Fee.of_uint64 (Unsigned.UInt64.of_int64 internal_cmd.fee)
       in
       let fee_transfer = Coinbase_fee_transfer.create ~receiver_pk ~fee in
-      Hashtbl.add_exn fee_transfer_tbl ~key:internal_cmd.sequence_no
+      Hashtbl.add_exn fee_transfer_tbl
+        ~key:(internal_cmd.global_slot, internal_cmd.sequence_no)
         ~data:fee_transfer
   | _ ->
       Deferred.unit
 
 let run_internal_command ~logger ~pool ~ledger (cmd : Sql.Internal_command.t) =
-  [%log info] "Applying internal command with sequence number %d"
-    cmd.sequence_no ;
+  [%log info]
+    "Applying internal command with global slot %Ld and sequence number %d"
+    cmd.global_slot cmd.sequence_no ;
   let%bind receiver_pk = pk_of_pk_id pool cmd.receiver_id in
   let fee = Currency.Fee.of_uint64 (Unsigned.UInt64.of_int64 cmd.fee) in
   let fee_token = Token_id.of_uint64 (Unsigned.UInt64.of_int64 cmd.token) in
-  let txn_global_slot = Coda_numbers.Global_slot.of_int cmd.global_slot in
+  let txn_global_slot =
+    cmd.global_slot |> Unsigned.UInt32.of_int64
+    |> Coda_numbers.Global_slot.of_uint32
+  in
   let fail_on_error err =
     failwithf
       "Error applying internal command with sequence number %d, error: %s"
@@ -108,7 +124,9 @@ let run_internal_command ~logger ~pool ~ledger (cmd : Sql.Internal_command.t) =
   | "coinbase" -> (
       let amount = Currency.Fee.to_uint64 fee |> Currency.Amount.of_uint64 in
       (* combining situation 1: add cached coinbase fee transfer, if it exists *)
-      let fee_transfer = Hashtbl.find fee_transfer_tbl cmd.sequence_no in
+      let fee_transfer =
+        Hashtbl.find fee_transfer_tbl (cmd.global_slot, cmd.sequence_no)
+      in
       let coinbase =
         match Coinbase.create ~amount ~receiver:receiver_pk ~fee_transfer with
         | Ok cb ->
@@ -153,7 +171,10 @@ let apply_combined_fee_transfer ~logger ~pool ~ledger
         failwithf "Could not create combined fee transfer, error: %s"
           (Error.to_string_hum err) ()
   in
-  let txn_global_slot = Coda_numbers.Global_slot.of_int cmd2.global_slot in
+  let txn_global_slot =
+    cmd2.global_slot |> Unsigned.UInt32.of_int64
+    |> Coda_numbers.Global_slot.of_uint32
+  in
   let undo_or_error =
     Ledger.apply_fee_transfer ~constraint_constants ~txn_global_slot ledger
       fee_transfer
@@ -168,18 +189,24 @@ let apply_combined_fee_transfer ~logger ~pool ~ledger
         cmd1.sequence_no (Error.to_string_hum err) ()
 
 let body_of_sql_user_cmd pool
-    ({type_; source_id; receiver_id; token= tok; amount; _} :
+    ({type_; source_id; receiver_id; token= tok; amount; global_slot; _} :
       Sql.User_command.t) : Signed_command_payload.Body.t Deferred.t =
   let open Signed_command_payload.Body in
   let open Deferred.Let_syntax in
   let%bind source_pk = pk_of_pk_id pool source_id in
   let%map receiver_pk = pk_of_pk_id pool receiver_id in
   let token_id = Token_id.of_uint64 (Unsigned.UInt64.of_int64 tok) in
-  let amount = Currency.Amount.of_uint64 (Unsigned.UInt64.of_int64 amount) in
+  let amount =
+    Option.map amount
+      ~f:(Fn.compose Currency.Amount.of_uint64 Unsigned.UInt64.of_int64)
+  in
   (* possibilities from user_command_type enum in SQL schema *)
   (* TODO: handle "snapp" user commands *)
   match type_ with
   | "payment" ->
+      if Option.is_none amount then
+        failwithf "Payment at global slot %Ld has NULL amount" global_slot () ;
+      let amount = Option.value_exn amount in
       Payment Payment_payload.Poly.{source_pk; receiver_pk; token_id; amount}
   | "delegation" ->
       Stake_delegation
@@ -196,6 +223,10 @@ let body_of_sql_user_cmd pool
         ; receiver_pk
         ; account_disabled= false }
   | "mint_tokens" ->
+      if Option.is_none amount then
+        failwithf "Mint token at global slot %Ld has NULL amount" global_slot
+          () ;
+      let amount = Option.value_exn amount in
       Mint_tokens
         { Minting_payload.token_id
         ; token_owner_pk= source_pk
@@ -205,7 +236,9 @@ let body_of_sql_user_cmd pool
       failwithf "Invalid user command type: %s" type_ ()
 
 let run_user_command ~logger ~pool ~ledger (cmd : Sql.User_command.t) =
-  [%log info] "Apply user command with sequence number %d" cmd.sequence_no ;
+  [%log info]
+    "Applying user command with global slot %Ld and sequence number %d"
+    cmd.global_slot cmd.sequence_no ;
   let%bind body = body_of_sql_user_cmd pool cmd in
   let%map fee_payer_pk = pk_of_pk_id pool cmd.fee_payer_id in
   let payload =
@@ -230,7 +263,7 @@ let run_user_command ~logger ~pool ~ledger (cmd : Sql.User_command.t) =
         valid_signed_cmd) =
     Signed_command.to_valid_unsafe signed_cmd
   in
-  let txn_global_slot = Unsigned.UInt32.of_int cmd.global_slot in
+  let txn_global_slot = Unsigned.UInt32.of_int64 cmd.global_slot in
   match
     Ledger.apply_user_command ~constraint_constants ~txn_global_slot ledger
       valid_signed_cmd
@@ -327,9 +360,11 @@ let main ~input_file ~output_file ~archive_uri () =
       let unsorted_internal_cmds = List.concat unsorted_internal_cmds_list in
       let sorted_internal_cmds =
         List.sort unsorted_internal_cmds ~compare:(fun ic1 ic2 ->
-            if Int.equal ic1.sequence_no ic2.sequence_no then
-              Int.compare ic1.secondary_sequence_no ic2.secondary_sequence_no
-            else Int.compare ic1.sequence_no ic2.sequence_no )
+            if Int64.equal ic1.global_slot ic2.global_slot then
+              if Int.equal ic1.sequence_no ic2.sequence_no then
+                Int.compare ic1.secondary_sequence_no ic2.secondary_sequence_no
+              else Int.compare ic1.sequence_no ic2.sequence_no
+            else Int64.compare ic1.global_slot ic2.global_slot )
       in
       (* populate cache of fee transfer via coinbase items *)
       let%bind () =
@@ -342,9 +377,8 @@ let main ~input_file ~output_file ~archive_uri () =
             match%map
               Caqti_async.Pool.use (fun db -> Sql.User_command.run db id) pool
             with
-            | Ok [] ->
-                failwithf "Could not find any user commands with id: %d" id ()
             | Ok user_cmds ->
+                (* N.B.: may be empty list, if the command status is not 'applied' *)
                 user_cmds
             | Error msg ->
                 failwithf
@@ -354,7 +388,9 @@ let main ~input_file ~output_file ~archive_uri () =
       let unsorted_user_cmds = List.concat unsorted_user_cmds_list in
       let sorted_user_cmds =
         List.sort unsorted_user_cmds ~compare:(fun uc1 uc2 ->
-            Int.compare uc1.sequence_no uc2.sequence_no )
+            if Int64.equal uc1.global_slot uc2.global_slot then
+              Int.compare uc1.sequence_no uc2.sequence_no
+            else Int64.compare uc1.global_slot uc2.global_slot )
       in
       (* apply commands in sequence order *)
       let rec apply_commands (internal_cmds : Sql.Internal_command.t list)
@@ -377,27 +413,32 @@ let main ~input_file ~output_file ~archive_uri () =
               let%bind () = run_internal_command ~logger ~pool ~ledger ic in
               apply_commands ics user_cmds
         in
-        (* choose command with least sequence number
+        (* choose command with least global slot, sequence number
          TODO: check for gaps?
-      *)
+        *)
+        let cmp_ic_uc (ic : Sql.Internal_command.t) (uc : Sql.User_command.t) =
+          [%compare: int64 * int]
+            (ic.global_slot, ic.sequence_no)
+            (uc.global_slot, uc.sequence_no)
+        in
         match (internal_cmds, user_cmds) with
         | [], [] ->
             Deferred.unit
         | [], uc :: ucs ->
             let%bind () = run_user_command ~logger ~pool ~ledger uc in
             apply_commands [] ucs
-        | ic :: _, uc :: ucs when ic.sequence_no > uc.sequence_no ->
+        | ic :: _, uc :: ucs when cmp_ic_uc ic uc > 0 ->
             let%bind () = run_user_command ~logger ~pool ~ledger uc in
             apply_commands internal_cmds ucs
         | ic :: ics, [] ->
             combine_or_run_internal_cmds ic ics
-        | ic :: ics, uc :: _ when ic.sequence_no < uc.sequence_no ->
+        | ic :: ics, uc :: _ when cmp_ic_uc ic uc < 0 ->
             combine_or_run_internal_cmds ic ics
         | ic :: _, _ :: __ ->
             failwithf
-              "An internal command and a user command have the same sequence \
-               number %d"
-              ic.sequence_no ()
+              "An internal command and a user command have the same global \
+               slot %Ld and sequence number %d"
+              ic.global_slot ic.sequence_no ()
       in
       let%bind () = apply_commands sorted_internal_cmds sorted_user_cmds in
       [%log info] "Writing output to $output_file"

@@ -51,8 +51,8 @@ module User_command = struct
     ; fee: int64
     ; fee_token: int64
     ; token: int64
-    ; amount: int64
-    ; global_slot: int
+    ; amount: int64 option
+    ; global_slot: int64
     ; sequence_no: int }
 
   let typ =
@@ -82,8 +82,8 @@ module User_command = struct
     let rep =
       Caqti_type.(
         tup3 (tup4 string int int int)
-          (tup4 int64 int64 int64 int64)
-          (tup2 int int))
+          (tup4 int64 int64 int64 (option int64))
+          (tup2 int64 int))
     in
     Caqti_type.custom ~encode ~decode rep
 
@@ -130,7 +130,7 @@ module Internal_command = struct
     ; receiver_id: int
     ; fee: int64
     ; token: int64
-    ; global_slot: int
+    ; global_slot: int64
     ; sequence_no: int
     ; secondary_sequence_no: int }
 
@@ -156,7 +156,8 @@ module Internal_command = struct
         ; secondary_sequence_no }
     in
     let rep =
-      Caqti_type.(tup3 (tup2 string int) (tup2 int64 int64) (tup3 int int int))
+      Caqti_type.(
+        tup3 (tup2 string int) (tup2 int64 int64) (tup3 int64 int int))
     in
     Caqti_type.custom ~encode ~decode rep
 
