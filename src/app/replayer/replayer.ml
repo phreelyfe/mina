@@ -68,14 +68,13 @@ let cache_fee_transfer_via_coinbase pool
     (internal_cmd : Sql.Internal_command.t) =
   match internal_cmd.type_ with
   | "fee_transfer_via_coinbase" ->
-      let%bind receiver_pk = pk_of_pk_id pool internal_cmd.receiver_id in
+      let%map receiver_pk = pk_of_pk_id pool internal_cmd.receiver_id in
       let fee =
         Currency.Fee.of_uint64 (Unsigned.UInt64.of_int64 internal_cmd.fee)
       in
       let fee_transfer = Coinbase_fee_transfer.create ~receiver_pk ~fee in
-      return
-        (Hashtbl.add_exn fee_transfer_tbl ~key:internal_cmd.sequence_no
-           ~data:fee_transfer)
+      Hashtbl.add_exn fee_transfer_tbl ~key:internal_cmd.sequence_no
+        ~data:fee_transfer
   | _ ->
       Deferred.unit
 
@@ -243,6 +242,13 @@ let run_user_command ~logger ~pool ~ledger (cmd : Sql.User_command.t) =
         "Could not apply user command with sequence number %d, error: %s"
         cmd.sequence_no (Error.to_string_hum err) ()
 
+let unquoted_string_of_yojson json =
+  (* Yojson.Safe.to_string produces double-quoted strings
+     remove those quotes for SQL queries
+  *)
+  let s = Yojson.Safe.to_string json in
+  String.sub s ~pos:1 ~len:(String.length s - 2)
+
 let main ~input_file ~output_file ~archive_uri () =
   let logger = Logger.create () in
   let json = Yojson.Safe.from_file input_file in
@@ -266,7 +272,8 @@ let main ~input_file ~output_file ~archive_uri () =
       [%log info] "Successfully created Caqti pool for Postgresql" ;
       let ledger = create_ledger input.genesis_ledger in
       let state_hash =
-        State_hash.to_yojson input.target_state_hash |> Yojson.Safe.to_string
+        State_hash.to_yojson input.target_state_hash
+        |> unquoted_string_of_yojson
       in
       [%log info] "Loading user command ids" ;
       let%bind user_cmd_ids =
@@ -360,8 +367,8 @@ let main ~input_file ~output_file ~archive_uri () =
                  && String.equal ic.type_ "fee_transfer"
                  && String.equal ic.type_ ic2.type_ ->
               (* combining situation 2
-               two fee transfer commands with same sequence number
-            *)
+             two fee transfer commands with same sequence number
+          *)
               let%bind () =
                 apply_combined_fee_transfer ~logger ~pool ~ledger ic ic2
               in
@@ -371,8 +378,8 @@ let main ~input_file ~output_file ~archive_uri () =
               apply_commands ics user_cmds
         in
         (* choose command with least sequence number
-           TODO: check for gaps?
-        *)
+         TODO: check for gaps?
+      *)
         match (internal_cmds, user_cmds) with
         | [], [] ->
             Deferred.unit

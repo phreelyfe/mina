@@ -89,7 +89,7 @@ module User_command = struct
 
   (* do we need to consider fee_payer/receiver_account creation fee paid? *)
   let query =
-    Caqti_request.find_opt Caqti_type.int typ
+    Caqti_request.collect Caqti_type.int typ
       {|
          SELECT type,fee_payer_id, source_id,receiver_id,fee,fee_token,token,amount,global_slot,sequence_no FROM
 
@@ -118,9 +118,7 @@ end
 module Internal_command_ids = struct
   let query =
     Caqti_request.collect Caqti_type.string Caqti_type.int
-      "SELECT COUNT(id) FROM blocks WHERE state_hash = ?"
-
-  (* (find_command_ids_query "internal") *)
+      (find_command_ids_query "internal")
 
   let run (module Conn : Caqti_async.CONNECTION) state_hash =
     Conn.collect_list query state_hash
@@ -163,13 +161,13 @@ module Internal_command = struct
     Caqti_type.custom ~encode ~decode rep
 
   let query =
-    Caqti_request.find_opt Caqti_type.int typ
+    Caqti_request.collect Caqti_type.int typ
       {|
          SELECT type,receiver_id,fee,token,global_slot,sequence_no,secondary_sequence_no FROM
 
          (SELECT * FROM internal_commands WHERE id = ?) AS ic
 
-         INNER_JOIN
+         INNER JOIN
 
          blocks_internal_commands AS bic
 
@@ -177,7 +175,7 @@ module Internal_command = struct
 
          ic.id = bic.internal_command_id
 
-         INNER_JOIN
+         INNER JOIN
 
          blocks
 
