@@ -360,11 +360,10 @@ let main ~input_file ~output_file ~archive_uri () =
       let unsorted_internal_cmds = List.concat unsorted_internal_cmds_list in
       let sorted_internal_cmds =
         List.sort unsorted_internal_cmds ~compare:(fun ic1 ic2 ->
-            if Int64.equal ic1.global_slot ic2.global_slot then
-              if Int.equal ic1.sequence_no ic2.sequence_no then
-                Int.compare ic1.secondary_sequence_no ic2.secondary_sequence_no
-              else Int.compare ic1.sequence_no ic2.sequence_no
-            else Int64.compare ic1.global_slot ic2.global_slot )
+            let tuple (ic : Sql.Internal_command.t) =
+              (ic.global_slot, ic.sequence_no, ic.secondary_sequence_no)
+            in
+            [%compare: int64 * int * int] (tuple ic1) (tuple ic2) )
       in
       (* populate cache of fee transfer via coinbase items *)
       let%bind () =
@@ -388,11 +387,12 @@ let main ~input_file ~output_file ~archive_uri () =
       let unsorted_user_cmds = List.concat unsorted_user_cmds_list in
       let sorted_user_cmds =
         List.sort unsorted_user_cmds ~compare:(fun uc1 uc2 ->
-            if Int64.equal uc1.global_slot uc2.global_slot then
-              Int.compare uc1.sequence_no uc2.sequence_no
-            else Int64.compare uc1.global_slot uc2.global_slot )
+            let tuple (uc : Sql.User_command.t) =
+              (uc.global_slot, uc.sequence_no)
+            in
+            [%compare: int64 * int] (tuple uc1) (tuple uc2) )
       in
-      (* apply commands in sequence order *)
+      (* apply commands in global slot, sequence order *)
       let rec apply_commands (internal_cmds : Sql.Internal_command.t list)
           (user_cmds : Sql.User_command.t list) =
         let combine_or_run_internal_cmds (ic : Sql.Internal_command.t)
